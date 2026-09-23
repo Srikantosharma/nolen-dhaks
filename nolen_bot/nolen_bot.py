@@ -38,7 +38,7 @@ load_dotenv()
 #   The bot automatically uses RENDER_EXTERNAL_URL for webhook mode.
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8802059784:AAGM-4rbvNGItC_h31jrbjcXpgZmXiz95Ec").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8802059784:AAH37JB_LcO82l7uR0Fe0EtRwDoChA0Z5oQ").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6330924087"))
 GROUP_ID = int(os.getenv("GROUP_ID", "-1004474328767"))
 GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/nolen_chat").strip()
