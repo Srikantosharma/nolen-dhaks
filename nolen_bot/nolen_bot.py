@@ -46,10 +46,16 @@ PORT = int(os.getenv("PORT", "10000"))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nolen-webhook-2026").strip()
 
-# Render persistent disk: set DATABASE_PATH=/var/data/nolen.db
-# Local default: nolen.db next to this file.
+# Database path
+# Render Free: use /tmp because persistent disks are unavailable.
+# Local: keep nolen.db next to this file.
 DEFAULT_DB = Path(__file__).resolve().parent / "nolen.db"
-DB_PATH = Path(os.getenv("DATABASE_PATH", str(DEFAULT_DB)))
+
+if os.getenv("RENDER"):
+    DB_PATH = Path("/tmp/nolen.db")
+else:
+    DB_PATH = Path(os.getenv("DATABASE_PATH", str(DEFAULT_DB)))
+
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # Requested hidden earning behavior.
