@@ -3,19 +3,19 @@ services:
     name: nolen-bot
     runtime: python
     plan: starter
+
     buildCommand: pip install -r requirements.txt
     startCommand: python nolen_bot.py
-    healthCheckPath: /
+
     envVars:
       - key: BOT_TOKEN
         sync: false
+
       - key: ADMIN_ID
         value: "6330924087"
-      - key: GROUP_ID
-        value: "-1004474328767"
-      - key: GROUP_LINK
-        value: "https://t.me/nolen_chat"
+
       - key: WEBHOOK_SECRET
         generateValue: true
+
       - key: DATABASE_PATH
         value: "/var/data/nolen.db"
