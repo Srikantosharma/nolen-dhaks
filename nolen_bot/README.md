@@ -1,38 +1,17 @@
-# Nolen Bot
+# Nolen Bot — Fixed Build
 
-Telegram chat-to-earn bot for @nolen_bot / @nolen_chat.
+Key fixes/features:
+- `/start`, `/admin`, and `/id` work only in private chats.
+- `/profile` and `/claim` work only in the official Nolen group.
+- Any other group command is ignored.
+- `/profile` shows a compact profile and attempts to include the user's Telegram avatar.
+- `/claim` gives a once-per-day 15–33 Nolen bonus and maintains a daily streak.
+- Referral deep links are correctly saved; referral earnings apply to chat rewards and claim bonuses.
+- Chat earning was reduced to a lower hidden range.
+- Nolen → Stars conversion atomically consumes Stars payout stock.
+- Official group ID/link are locked in code to prevent a bad Render GROUP_LINK override.
+- Bot token is read only from `BOT_TOKEN`; no token is hardcoded.
+- Inline button background colours are controlled by Telegram; the UI uses emoji accents instead.
 
-## Local
-
-```powershell
-py -m pip install -r requirements.txt
-Copy-Item .env.example .env
-# edit .env and add BOT_TOKEN
-py nolen_bot.py
-```
-
-## Telegram requirements
-
-1. Add the bot to `@nolen_chat`.
-2. Make it an admin.
-3. In BotFather, make sure group privacy does not prevent the bot from receiving ordinary group messages. An admin bot receives all group messages.
-
-## Render
-
-Use a paid Render Web Service and attach a persistent disk mounted at `/var/data`.
-
-Build command:
-`pip install -r requirements.txt`
-
-Start command:
-`python nolen_bot.py`
-
-Set:
-`BOT_TOKEN` = BotFather token
-`DATABASE_PATH` = `/var/data/nolen.db`
-
-Render provides `RENDER_EXTERNAL_URL`, which this app uses automatically for the webhook.
-
-## Important Stars note
-
-The app supports an internal Stars balance, conversion packages and Stars withdrawal requests with stock reservation. The Bot API does not provide a simple generic method for sending an arbitrary raw Stars balance directly to another user's personal Stars balance. The admin therefore confirms a payout only after completing the real supported Telegram payout flow.
+Important:
+The bot token that was exposed in the earlier source should be revoked/regenerated in BotFather before using this build.
