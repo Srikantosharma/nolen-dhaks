@@ -48,10 +48,12 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nolen-webhook-2026").strip()
 
 # Render persistent disk: set DATABASE_PATH=/var/data/nolen.db
 # Local default: nolen.db next to this file.
-DEFAULT_DB = Path(__file__).resolve().parent / "nolen.db"
-DB_PATH = Path(os.getenv("DATABASE_PATH", str(DEFAULT_DB)))
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+import os
+from pathlib import Path
 
+DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+DB_PATH = DATA_DIR / "nolen.db"
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 # Requested hidden earning behavior.
 # Normal users are NOT shown these thresholds.
 HIDDEN_MIN_MESSAGES = 4
