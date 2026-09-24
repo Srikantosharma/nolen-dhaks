@@ -38,7 +38,7 @@ load_dotenv()
 #   The bot automatically uses RENDER_EXTERNAL_URL for webhook mode.
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8802059784:AAH37JB_LcO82l7uR0Fe0EtRwDoChA0Z5oQ").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6330924087"))
 GROUP_ID = int(os.getenv("GROUP_ID", "-1004474328767"))
 GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/nolen_chat").strip()
@@ -46,16 +46,10 @@ PORT = int(os.getenv("PORT", "10000"))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nolen-webhook-2026").strip()
 
-# Database path
-# Render Free: use /tmp because persistent disks are unavailable.
-# Local: keep nolen.db next to this file.
+# Render persistent disk: set DATABASE_PATH=/var/data/nolen.db
+# Local default: nolen.db next to this file.
 DEFAULT_DB = Path(__file__).resolve().parent / "nolen.db"
-
-if os.getenv("RENDER"):
-    DB_PATH = Path("/tmp/nolen.db")
-else:
-    DB_PATH = Path(os.getenv("DATABASE_PATH", str(DEFAULT_DB)))
-
+DB_PATH = Path(os.getenv("DATABASE_PATH", str(DEFAULT_DB)))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # Requested hidden earning behavior.
