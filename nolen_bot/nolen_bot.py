@@ -43,7 +43,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6330924087"))
 # Official Nolen group is intentionally locked here so a stale Render
 # GROUP_LINK/GROUP_ID variable cannot point users to an unrelated chat.
-GROUP_ID = --1003538144204
+GROUP_ID = -1003538144204
 GROUP_LINK = "https://t.me/nolen_chat"
 PORT = int(os.getenv("PORT", "10000"))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
