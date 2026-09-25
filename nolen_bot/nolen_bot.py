@@ -9,7 +9,8 @@ from pathlib import Path
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
@@ -40,30 +41,32 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6330924087"))
-GROUP_ID = int(os.getenv("GROUP_ID", "-1003538144204"))
-GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/nolen_chat").strip()
+# Official Nolen group is intentionally locked here so a stale Render
+# GROUP_LINK/GROUP_ID variable cannot point users to an unrelated chat.
+GROUP_ID = -1004474328767
+GROUP_LINK = "https://t.me/nolen_chat"
 PORT = int(os.getenv("PORT", "10000"))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nolen-webhook-2026").strip()
 
 # Render persistent disk: set DATABASE_PATH=/var/data/nolen.db
 # Local default: nolen.db next to this file.
-import os
-from pathlib import Path
-
-DATA_DIR = Path(os.getenv("DATA_DIR", "."))
-DB_PATH = DATA_DIR / "nolen.db"
+DEFAULT_DB = Path(__file__).resolve().parent / "nolen.db"
+DB_PATH = Path(os.getenv("DATABASE_PATH", str(DEFAULT_DB)))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 # Requested hidden earning behavior.
 # Normal users are NOT shown these thresholds.
-HIDDEN_MIN_MESSAGES = 4
-HIDDEN_MAX_MESSAGES = 5
-HIDDEN_MIN_REWARD = 5
-HIDDEN_MAX_REWARD = 10
+HIDDEN_MIN_MESSAGES = 5
+HIDDEN_MAX_MESSAGES = 7
+HIDDEN_MIN_REWARD = 2
+HIDDEN_MAX_REWARD = 5
 HIDDEN_MESSAGE_COOLDOWN = 2.0
 HIDDEN_DUPLICATE_WINDOW = 30.0
 HIDDEN_SESSION_GAP = 300.0
 HIDDEN_MAX_SECONDS_PER_GAP = 60.0
+CLAIM_MIN_REWARD = 15
+CLAIM_MAX_REWARD = 33
 
 USD_PACKAGES = (2000, 5000, 9000, 15000, 20000)
 STAR_PACKAGES = (
@@ -157,9 +160,13 @@ def init_db():
                 next_trigger INTEGER NOT NULL DEFAULT 5,
 
                 referred_by INTEGER,
+                referral_activated INTEGER NOT NULL DEFAULT 0,
                 referrals INTEGER NOT NULL DEFAULT 0,
                 referral_earned REAL NOT NULL DEFAULT 0,
-                earning_multiplier REAL NOT NULL DEFAULT 1.0
+                earning_multiplier REAL NOT NULL DEFAULT 1.0,
+
+                claim_streak INTEGER NOT NULL DEFAULT 0,
+                last_claim_date TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_users_username
@@ -222,7 +229,31 @@ def init_db():
                 created_at TEXT NOT NULL,
                 replied INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS group_warnings (
+                id TEXT PRIMARY KEY,
+                group_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                admin_id INTEGER NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_group_warnings_user
+                ON group_warnings(group_id, user_id, created_at);
             """
+        )
+
+        # Backward-compatible migrations for existing nolen.db files.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "referral_activated" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN referral_activated INTEGER NOT NULL DEFAULT 0")
+        if "claim_streak" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN claim_streak INTEGER NOT NULL DEFAULT 0")
+        if "last_claim_date" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN last_claim_date TEXT")
+        conn.execute(
+            "UPDATE users SET referral_activated = 1 WHERE referral_activated = 0 AND referred_by IS NOT NULL AND joined_group = 1"
         )
 
         for key, value in DEFAULT_SETTINGS.items():
@@ -285,6 +316,23 @@ def ensure_user(tg_user, referrer_id=None):
         ).fetchone()
 
         if existing:
+            # A referral can be attached only while the account has no referrer yet.
+            if not existing["referred_by"] and referrer_id and referrer_id != user_id:
+                ref = conn.execute(
+                    "SELECT telegram_id FROM users WHERE telegram_id = ? AND banned = 0",
+                    (referrer_id,),
+                ).fetchone()
+                if ref:
+                    conn.execute(
+                        """
+                        UPDATE users
+                        SET username = ?, full_name = ?, updated_at = ?, last_seen = ?, referred_by = ?
+                        WHERE telegram_id = ?
+                        """,
+                        (username, full_name, timestamp, timestamp, referrer_id, user_id),
+                    )
+                    return False
+
             conn.execute(
                 """
                 UPDATE users
@@ -298,7 +346,7 @@ def ensure_user(tg_user, referrer_id=None):
         valid_referrer = None
         if referrer_id and referrer_id != user_id:
             ref = conn.execute(
-                "SELECT telegram_id FROM users WHERE telegram_id = ?",
+                "SELECT telegram_id FROM users WHERE telegram_id = ? AND banned = 0",
                 (referrer_id,),
             ).fetchone()
             if ref:
@@ -325,12 +373,6 @@ def ensure_user(tg_user, referrer_id=None):
             ),
         )
 
-        if valid_referrer:
-            conn.execute(
-                "UPDATE users SET referrals = referrals + 1 WHERE telegram_id = ?",
-                (valid_referrer,),
-            )
-
     return True
 
 
@@ -340,6 +382,54 @@ def set_joined(user_id, joined):
             "UPDATE users SET joined_group = ?, updated_at = ? WHERE telegram_id = ?",
             (1 if joined else 0, now_iso(), user_id),
         )
+
+
+def activate_referral(user_id):
+    """Activate a referral exactly once, after the referred user joins the official group."""
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT referred_by, referral_activated FROM users WHERE telegram_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row or not row["referred_by"] or row["referral_activated"]:
+            conn.commit()
+            return False
+
+        referrer_id = row["referred_by"]
+        ref = conn.execute(
+            "SELECT telegram_id, banned FROM users WHERE telegram_id = ?",
+            (referrer_id,),
+        ).fetchone()
+        if not ref or ref["banned"]:
+            conn.execute(
+                "UPDATE users SET referral_activated = 1, updated_at = ? WHERE telegram_id = ?",
+                (now_iso(), user_id),
+            )
+            conn.commit()
+            return False
+
+        conn.execute(
+            "UPDATE users SET referral_activated = 1, updated_at = ? WHERE telegram_id = ?",
+            (now_iso(), user_id),
+        )
+        conn.execute(
+            "UPDATE users SET referrals = referrals + 1, updated_at = ? WHERE telegram_id = ?",
+            (now_iso(), referrer_id),
+        )
+        conn.commit()
+        return True
+
+
+async def is_group_admin(bot, user_id):
+    """True for official group admins/owner, plus the configured bot owner."""
+    if int(user_id) == ADMIN_ID:
+        return True
+    try:
+        member = await bot.get_chat_member(GROUP_ID, user_id)
+        return member.status in {"administrator", "creator"}
+    except (BadRequest, Forbidden, TelegramError):
+        return False
 
 
 def set_banned(user_id, banned):
@@ -815,7 +905,15 @@ async def convert_stars(query, context, points, stars):
 
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT nolen, banned FROM users WHERE telegram_id = ?", (query.from_user.id,)).fetchone()
+        row = conn.execute(
+            "SELECT nolen, banned FROM users WHERE telegram_id = ?",
+            (query.from_user.id,),
+        ).fetchone()
+        stock_row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'stars_stock'"
+        ).fetchone()
+        stock = float(stock_row["value"]) if stock_row else 0.0
+
         if not row or row["banned"]:
             conn.rollback()
             await query.answer("Account unavailable.", show_alert=True)
@@ -824,11 +922,20 @@ async def convert_stars(query, context, points, stars):
             conn.rollback()
             await query.answer("Insufficient Nolen Points.", show_alert=True)
             return
+        if stock + 1e-9 < stars:
+            conn.rollback()
+            await query.answer("Not enough Stars stock available.", show_alert=True)
+            return
 
         ts = now_iso()
         conn.execute(
             "UPDATE users SET nolen = nolen - ?, stars = stars + ?, updated_at = ? WHERE telegram_id = ?",
             (points, stars, ts, query.from_user.id),
+        )
+        # Atomically consume the payout stock with the conversion.
+        conn.execute(
+            "UPDATE settings SET value = ? WHERE key = 'stars_stock'",
+            (str(stock - stars),),
         )
         conn.execute(
             """
@@ -849,7 +956,13 @@ async def convert_stars(query, context, points, stars):
     await query.answer("Conversion successful.")
     await edit_or_reply(
         query,
-        f"✅ <b>Conversion Successful</b>\n\n🪙 Spent: {fmt_num(points)} Nolen\n⭐ Added: {stars:,} Stars\n\nTransaction: <code>{txid}</code>",
+        (
+            f"✅ <b>Conversion Successful</b>\n\n"
+            f"🪙 Spent: {fmt_num(points)} Nolen\n"
+            f"⭐ Added: {stars:,} Stars\n"
+            f"📦 Stock left: {fmt_num(stock - stars)} Stars\n\n"
+            f"Transaction: <code>{txid}</code>"
+        ),
         home_back(),
         "HTML",
     )
@@ -1747,7 +1860,7 @@ def process_group_message(user, text):
                     (make_id("TX"), uid, reward, now_iso()),
                 )
 
-                referrer = row["referred_by"]
+                referrer = row["referred_by"] if row["referral_activated"] else None
                 if referrer:
                     ref = conn.execute(
                         "SELECT telegram_id, banned, earning_frozen FROM users WHERE telegram_id = ?",
@@ -1852,6 +1965,8 @@ async def chat_member_handler(update, context):
     )
     set_joined(user.id, is_member)
 
+    if is_member:
+        activate_referral(user.id)
     if is_member and cm.old_chat_member.status in {"left", "kicked"}:
         try:
             await context.bot.send_message(
@@ -1895,6 +2010,7 @@ async def callback_handler(update, context):
         ensure_user(query.from_user)
         if await is_group_member(context.bot, query.from_user.id):
             set_joined(query.from_user.id, True)
+            activate_referral(query.from_user.id)
             await edit_or_reply(query, "✅ <b>Membership confirmed!</b>\n\nYour profile is unlocked.", home_keyboard(), "HTML")
         else:
             await query.answer("Membership not confirmed yet.", show_alert=True)
@@ -2061,20 +2177,27 @@ async def callback_handler(update, context):
 # ============================================================
 
 async def start_command(update, context):
+    # /start is private-chat only. In the group it does absolutely nothing.
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return
+
     user = update.effective_user
     referrer_id = None
     if context.args:
         arg = context.args[0].strip()
         if arg.startswith("ref_") and arg[4:].isdigit():
-            referrer_id = int(arg[4:])
+            candidate = int(arg[4:])
+            if candidate != user.id:
+                referrer_id = candidate
 
-    was_new = ensure_user(user)
-    if was_new and referrer_id and referrer_id != user.id:
-        # ensure_user already inserts the referrer when possible.
-        pass
+    ensure_user(user, referrer_id=referrer_id)
 
     if is_admin(user.id):
-        await update.message.reply_text("🛡 <b>Nolen Admin</b>\n\nUse /admin.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛡 Admin Panel", callback_data="admin")]]))
+        await update.message.reply_text(
+            "🛡 <b>Nolen Admin</b>\n\nUse /admin.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛡️ Admin Panel", callback_data="admin")]]),
+        )
         return
 
     if not await is_group_member(context.bot, user.id):
@@ -2083,19 +2206,405 @@ async def start_command(update, context):
         return
 
     set_joined(user.id, True)
-    await update.message.reply_text("✅ <b>Welcome to Nolen!</b>\n\nYour profile is unlocked.", parse_mode="HTML", reply_markup=home_keyboard())
+    activate_referral(user.id)
+    await update.message.reply_text(
+        "✅ <b>Nolen unlocked.</b>\n\nYour profile is ready.",
+        parse_mode="HTML",
+        reply_markup=home_keyboard(),
+    )
 
 
 async def admin_command(update, context):
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Admin only.")
         return
     ensure_user(update.effective_user)
-    await update.message.reply_text("🛡 <b>Nolen Admin Panel</b>", parse_mode="HTML", reply_markup=admin_keyboard())
+    await update.message.reply_text(
+        "🛡️ <b>Nolen Admin Panel</b>",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard(),
+    )
 
 
 async def id_command(update, context):
-    await update.message.reply_text(f"Your Telegram User ID: <code>{update.effective_user.id}</code>", parse_mode="HTML")
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return
+    await update.message.reply_text(
+        f"Your Telegram User ID: <code>{update.effective_user.id}</code>",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# Group commands: profile / daily claim / moderation / support
+# ============================================================
+
+def group_target_from_update(update, context, require_target=True):
+    """Return (target_user, extra_args). Replies are preferred; otherwise username/ID."""
+    message = update.effective_message
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target = message.reply_to_message.from_user
+        return target, list(context.args)
+
+    args = list(context.args)
+    if not args:
+        return (None, args) if require_target else (message.from_user, args)
+
+    token = args.pop(0).strip()
+    target = None
+    if token.startswith("@"):
+        row = get_user_by_username(token)
+        if row:
+            target = type("TargetUser", (), {
+                "id": int(row["telegram_id"]),
+                "is_bot": False,
+                "username": row["username"],
+                "first_name": row["full_name"] or row["username"] or "User",
+                "last_name": None,
+            })()
+    elif token.isdigit():
+        try:
+            target = awaitable_noop_target(int(token))
+        except Exception:
+            target = None
+
+    return target, args
+
+
+def awaitable_noop_target(user_id):
+    return type("TargetUser", (), {
+        "id": int(user_id),
+        "is_bot": False,
+        "username": None,
+        "first_name": "User",
+        "last_name": None,
+    })()
+
+
+async def get_target_user(update, context):
+    message = update.effective_message
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user, list(context.args)
+
+    args = list(context.args)
+    if not args:
+        return None, args
+    token = args.pop(0).strip()
+    if token.startswith("@"):
+        row = get_user_by_username(token)
+        if not row:
+            return None, args
+        ensure_user(type("TargetUser", (), {
+            "id": int(row["telegram_id"]),
+            "is_bot": False,
+            "username": row["username"],
+            "first_name": row["full_name"] or "User",
+            "last_name": None,
+        })())
+        return type("TargetUser", (), {
+            "id": int(row["telegram_id"]),
+            "is_bot": False,
+            "username": row["username"],
+            "first_name": row["full_name"] or "User",
+            "last_name": None,
+        })(), args
+    if token.isdigit():
+        row = get_user(int(token))
+        if not row:
+            return None, args
+        return type("TargetUser", (), {
+            "id": int(row["telegram_id"]),
+            "is_bot": False,
+            "username": row["username"],
+            "first_name": row["full_name"] or "User",
+            "last_name": None,
+        })(), args
+    return None, args
+
+
+async def group_profile_command(update, context):
+    message = update.effective_message
+    if not message or message.chat.id != GROUP_ID:
+        return
+    user = update.effective_user
+    ensure_user(user)
+    member = await is_group_member(context.bot, user.id)
+    if not member:
+        set_joined(user.id, False)
+        return
+    set_joined(user.id, True)
+    activate_referral(user.id)
+
+    row = get_user(user.id)
+    username = f"@{user.username}" if user.username else "—"
+    caption = (
+        "👤 <b>Nolen Profile</b>\n"
+        f"<b>{(row['full_name'] or user.first_name or 'User')[:60]}</b>\n"
+        f"{username}\n\n"
+        f"💬 Messages: <b>{row['message_count']:,}</b>\n"
+        f"⏱ Active: <b>{fmt_duration(row['chat_seconds'])}</b>\n"
+        f"🪙 Nolen: <b>{fmt_num(row['nolen'])}</b>\n"
+        f"🔥 Claim streak: <b>{row['claim_streak']}d</b>"
+    )
+
+    try:
+        photos = await context.bot.get_user_profile_photos(user.id, limit=1)
+        if photos.photos:
+            file_id = photos.photos[0][-1].file_id
+            await message.reply_photo(photo=file_id, caption=caption, parse_mode="HTML")
+            return
+    except TelegramError:
+        pass
+    await message.reply_text(caption, parse_mode="HTML")
+
+
+async def group_claim_command(update, context):
+    message = update.effective_message
+    if not message or message.chat.id != GROUP_ID:
+        return
+    user = update.effective_user
+    if user.is_bot:
+        return
+    ensure_user(user)
+    if not await is_group_member(context.bot, user.id):
+        set_joined(user.id, False)
+        return
+    set_joined(user.id, True)
+    activate_referral(user.id)
+
+    today = day_key()
+    reward = 0.0
+    referral_reward = 0.0
+    streak = 0
+
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT nolen, banned, claim_streak, last_claim_date, referred_by, referral_activated, daily_earned FROM users WHERE telegram_id = ?",
+            (user.id,),
+        ).fetchone()
+        if not row or row["banned"]:
+            conn.rollback()
+            return
+        if row["last_claim_date"] == today:
+            conn.rollback()
+            await message.reply_text("🎁 <b>Daily Claim already collected.</b>\nCome back tomorrow.", parse_mode="HTML")
+            return
+
+        streak = int(row["claim_streak"] or 0)
+        last_claim = row["last_claim_date"]
+        try:
+            from datetime import date, timedelta
+            prev = date.fromisoformat(last_claim) if last_claim else None
+            today_date = date.fromisoformat(today)
+            if prev and today_date == prev + timedelta(days=1):
+                streak += 1
+            else:
+                streak = 1
+        except Exception:
+            streak = 1
+
+        cap = float(get_setting("daily_earning_cap", "5000"))
+        remaining = max(0.0, cap - float(row["daily_earned"] or 0))
+        reward = round(min(random.randint(CLAIM_MIN_REWARD, CLAIM_MAX_REWARD), remaining), 2)
+        if reward <= 0:
+            conn.rollback()
+            await message.reply_text("⚠️ Daily earning limit reached. Try again tomorrow.", parse_mode="HTML")
+            return
+
+        ts = now_iso()
+        conn.execute(
+            "UPDATE users SET nolen = nolen + ?, claim_streak = ?, last_claim_date = ?, daily_earned = daily_earned + ?, updated_at = ? WHERE telegram_id = ?",
+            (reward, streak, today, reward, ts, user.id),
+        )
+        conn.execute(
+            """
+            INSERT INTO transactions(id, user_id, currency, amount, direction, tx_type, note, created_at)
+            VALUES (?, ?, 'Nolen', ?, 'credit', 'DAILY_CLAIM', ?, ?)
+            """,
+            (make_id("TX"), user.id, reward, f"Daily claim streak {streak}d", ts),
+        )
+
+        if row["referred_by"] and row["referral_activated"]:
+            ref = conn.execute(
+                "SELECT telegram_id, banned, earning_frozen FROM users WHERE telegram_id = ?",
+                (row["referred_by"],),
+            ).fetchone()
+            if ref and not ref["banned"] and not ref["earning_frozen"]:
+                pct = float(get_setting("referral_percent", "10"))
+                referral_reward = round(reward * pct / 100.0, 2)
+                if referral_reward > 0:
+                    conn.execute(
+                        "UPDATE users SET nolen = nolen + ?, referral_earned = referral_earned + ?, updated_at = ? WHERE telegram_id = ?",
+                        (referral_reward, referral_reward, ts, row["referred_by"]),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO transactions(id, user_id, currency, amount, direction, tx_type, note, created_at)
+                        VALUES (?, ?, 'Nolen', ?, 'credit', 'REFERRAL_EARNING', ?, ?)
+                        """,
+                        (make_id("TX"), row["referred_by"], referral_reward, f"Claim referral from {user.id}", ts),
+                    )
+        conn.commit()
+
+    text = f"🎁 <b>Daily Claim</b>\n\n+<b>{fmt_num(reward)}</b> Nolen Points\n🔥 Streak: <b>{streak} day{'s' if streak != 1 else ''}</b>"
+    if referral_reward > 0:
+        text += f"\n👥 Referral bonus generated: <b>{fmt_num(referral_reward)}</b> Nolen"
+    await message.reply_text(text, parse_mode="HTML")
+
+
+async def group_support_command(update, context):
+    message = update.effective_message
+    if not message or message.chat.id != GROUP_ID:
+        return
+    body = " ".join(context.args).strip()
+    if message.reply_to_message and message.reply_to_message.text:
+        body = body or message.reply_to_message.text.strip()
+    if not body:
+        await message.reply_text("🆘 Usage: <code>/support your message</code>", parse_mode="HTML")
+        return
+    user = update.effective_user
+    ensure_user(user)
+    username = f"@{user.username}" if user.username else "-"
+    sid = make_id("SUP")
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO support_messages(id, user_id, message_text, created_at) VALUES (?, ?, ?, ?)",
+            (sid, user.id, body[:4000], now_iso()),
+        )
+    try:
+        await context.bot.send_message(
+            ADMIN_ID,
+            (
+                "🎫 <b>Group Support Request</b>\n\n"
+                f"Ticket: <code>{sid}</code>\n"
+                f"User: {username}\n"
+                f"User ID: <code>{user.id}</code>\n\n{body[:4000]}"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Reply", callback_data=f"sup_reply_{user.id}")]]),
+        )
+        await message.reply_text("✅ Support request sent to Nolen staff.")
+    except TelegramError:
+        await message.reply_text("⚠️ Support is temporarily unavailable.")
+
+
+async def moderate_target(update, context, action):
+    message = update.effective_message
+    if not message or message.chat.id != GROUP_ID:
+        return
+    if not await is_group_admin(context.bot, update.effective_user.id):
+        await message.reply_text("🛡️ This command is for group admins only.")
+        return
+    target, args = await get_target_user(update, context)
+    if not target:
+        await message.reply_text("Reply to a user or use <code>@username</code>/<code>UserID</code>.", parse_mode="HTML")
+        return
+    if target.id == update.effective_user.id:
+        await message.reply_text("⚠️ Invalid target.")
+        return
+    if target.id == ADMIN_ID:
+        await message.reply_text("⚠️ The main bot admin cannot be moderated here.")
+        return
+
+    target_row = get_user(target.id)
+    target_name = f"@{target.username}" if getattr(target, "username", None) else (getattr(target, "first_name", None) or str(target.id))
+
+    try:
+        if action == "warn":
+            reason = " ".join(args).strip() or "No reason provided"
+            with db() as conn:
+                conn.execute(
+                    "INSERT INTO group_warnings(id, group_id, user_id, admin_id, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (make_id("WR"), GROUP_ID, target.id, update.effective_user.id, reason[:1000], now_iso()),
+                )
+                count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM group_warnings WHERE group_id = ? AND user_id = ?",
+                    (GROUP_ID, target.id),
+                ).fetchone()["c"]
+            await message.reply_text(f"⚠️ <b>{target_name}</b> warned. Total warnings: <b>{count}</b>.", parse_mode="HTML")
+            audit(update.effective_user.id, "group_warn", target.id, reason[:500])
+            return
+
+        if action == "ban":
+            reason = " ".join(args).strip() or "No reason provided"
+            await context.bot.ban_chat_member(GROUP_ID, target.id)
+            set_banned(target.id, True)
+            audit(update.effective_user.id, "group_ban", target.id, reason[:500])
+            await message.reply_text(f"🚫 <b>{target_name}</b> has been banned from Nolen Chat.", parse_mode="HTML")
+            return
+
+        if action == "unban":
+            await context.bot.unban_chat_member(GROUP_ID, target.id, only_if_banned=True)
+            set_banned(target.id, False)
+            audit(update.effective_user.id, "group_unban", target.id, "")
+            await message.reply_text(f"✅ <b>{target_name}</b> has been unbanned.", parse_mode="HTML")
+            return
+
+        if action == "mute":
+            minutes = 10
+            if args and args[0].isdigit():
+                minutes = max(1, min(int(args[0]), 10080))
+                args = args[1:]
+            reason = " ".join(args).strip() or "No reason provided"
+            from datetime import datetime, timedelta, timezone
+            until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+            await context.bot.restrict_chat_member(
+                GROUP_ID,
+                target.id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=until,
+            )
+            audit(update.effective_user.id, "group_mute", target.id, f"{minutes}m | {reason[:450]}")
+            await message.reply_text(f"🔇 <b>{target_name}</b> muted for <b>{minutes}m</b>.", parse_mode="HTML")
+            return
+
+        if action == "unmute":
+            try:
+                permissions = ChatPermissions.all_permissions()
+            except AttributeError:
+                permissions = ChatPermissions(
+                    can_send_messages=True,
+                    can_send_audios=True,
+                    can_send_documents=True,
+                    can_send_photos=True,
+                    can_send_videos=True,
+                    can_send_video_notes=True,
+                    can_send_voice_notes=True,
+                    can_send_polls=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True,
+                    can_invite_users=True,
+                )
+            await context.bot.restrict_chat_member(GROUP_ID, target.id, permissions=permissions)
+            audit(update.effective_user.id, "group_unmute", target.id, "")
+            await message.reply_text(f"🔊 <b>{target_name}</b> can chat again.", parse_mode="HTML")
+            return
+    except TelegramError as exc:
+        await message.reply_text(f"⚠️ Telegram could not complete this action. Check that the bot is an admin with the required group permissions.\n\n<code>{str(exc)[:500]}</code>", parse_mode="HTML")
+
+
+async def warn_command(update, context):
+    await moderate_target(update, context, "warn")
+
+
+async def ban_group_command(update, context):
+    await moderate_target(update, context, "ban")
+
+
+async def unban_group_command(update, context):
+    await moderate_target(update, context, "unban")
+
+
+async def mute_group_command(update, context):
+    await moderate_target(update, context, "mute")
+
+
+async def unmute_group_command(update, context):
+    await moderate_target(update, context, "unmute")
+
 
 
 async def private_message_handler(update, context):
@@ -2128,11 +2637,27 @@ async def post_init(application: Application):
     me = await application.bot.get_me()
     application.bot_data["bot_username"] = me.username or ""
     logger.info("Running as @%s", me.username)
-    await application.bot.set_my_commands([
-        ("start", "Open Nolen"),
-        ("id", "Show your Telegram ID"),
-        ("admin", "Admin panel"),
-    ])
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "Open Nolen"),
+            BotCommand("id", "Show your Telegram ID"),
+            BotCommand("admin", "Admin panel"),
+        ],
+        scope=BotCommandScopeAllPrivateChats(),
+    )
+    await application.bot.set_my_commands(
+        [
+            BotCommand("profile", "Show your mini profile"),
+            BotCommand("claim", "Daily Nolen bonus"),
+            BotCommand("support", "Contact Nolen support"),
+            BotCommand("warn", "Admin: warn a member"),
+            BotCommand("ban", "Admin: ban a member"),
+            BotCommand("mute", "Admin: mute a member"),
+            BotCommand("unban", "Admin: unban a member"),
+            BotCommand("unmute", "Admin: unmute a member"),
+        ],
+        scope=BotCommandScopeAllGroupChats(),
+    )
 
 
 async def error_handler(update, context):
@@ -2167,6 +2692,16 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("id", id_command))
+
+    # Group-only commands. The handlers themselves ignore private chats.
+    application.add_handler(CommandHandler("profile", group_profile_command))
+    application.add_handler(CommandHandler("claim", group_claim_command))
+    application.add_handler(CommandHandler("support", group_support_command))
+    application.add_handler(CommandHandler("warn", warn_command))
+    application.add_handler(CommandHandler("ban", ban_group_command))
+    application.add_handler(CommandHandler("mute", mute_group_command))
+    application.add_handler(CommandHandler("unban", unban_group_command))
+    application.add_handler(CommandHandler("unmute", unmute_group_command))
 
     # Private conversations and user input.
     application.add_handler(
