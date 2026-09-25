@@ -16,6 +16,3 @@ services:
 
       - key: WEBHOOK_SECRET
         generateValue: true
-
-      - key: DATABASE_PATH
-        value: "/var/data/nolen.db"
